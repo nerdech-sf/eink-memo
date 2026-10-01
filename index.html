@@ -60,6 +60,8 @@ $('conn').onclick = async () => {
     const srv = await dev.gatt.connect();
     const svc = await srv.getPrimaryService(SERVICE);
     ch = await svc.getCharacteristic(CHAR);
+    await ch.writeValueWithResponse(
+      new TextEncoder().encode('\x04' + Math.floor(Date.now() / 1000)));
     $('send').disabled = false;
     setStatus('接続済み: ' + dev.name);
   } catch (e) {
