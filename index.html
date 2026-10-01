@@ -141,6 +141,7 @@ $('clear').onclick = () => {
 function setStatus(msg) { $('status').textContent = msg; }
 
 const bound = new WeakSet();
+let currentDev = null;   // 今つないでいるデバイス
 let connecting = null;   // 進行中の接続処理
 let pendingDev = null;   // 接続しようとしているデバイス
 
@@ -156,6 +157,7 @@ async function doAttach(dev) {
     try {
       setStatus('接続中…（' + attempt + '/3）');
       const srv = await dev.gatt.connect();
+        currentDev = dev;
       await new Promise((r) => setTimeout(r, 500));     // 接続直後は少し待つ
       const svc = await srv.getPrimaryService(SERVICE);
       ch = await svc.getCharacteristic(CHAR);
@@ -234,6 +236,14 @@ async function autoConnect() {
     setStatus('自動接続できませんでした。「接続」を押してください');
   }
 }
+
+// ページを閉じる・再読み込みする直前に、自分から切断する
+window.addEventListener('pagehide', () => {
+  try {
+    if (currentDev && currentDev.gatt.connected) currentDev.gatt.disconnect();
+  } catch (e) {}
+});
+
 // ---------- 画面に反映 ----------
 $('send').onclick = async () => {
   if (!ch) return;
