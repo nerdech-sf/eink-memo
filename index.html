@@ -25,7 +25,13 @@
 <h2>E-Paper Memo</h2>
 
 <div id="status">未接続</div>
-<button id="conn">接続</button>
+
+<div class="row">
+  <input id="pin" type="password" inputmode="numeric" autocomplete="off"
+         maxlength="12" placeholder="暗証番号">
+  <button id="conn">接続</button>
+</div>
+<div class="note">暗証番号は、この端末のブラウザにだけ保存されます。</div>
 
 <h3>今日の予定</h3>
 <div id="rows"></div>
@@ -48,16 +54,19 @@
 </p>
 
 <script>
-const SERVICE  = '6e2f0001-b5a3-f393-e0a9-e50e24dcca9e';
-const CHAR     = '6e2f0002-b5a3-f393-e0a9-e50e24dcca9e';
+const SERVICE     = '6e2f0001-b5a3-f393-e0a9-e50e24dcca9e';
+const CHAR        = '6e2f0002-b5a3-f393-e0a9-e50e24dcca9e';
+const STATUS_CHAR = '6e2f0003-b5a3-f393-e0a9-e50e24dcca9e';
 const CHUNK    = 100;          // 送信に失敗する場合は 19 に下げる
 const KEY      = 'epaper-memo-v1';
+const PIN_KEY  = 'epaper-memo-pin';
 const MAXBYTES = 1500;
 
 const $ = (id) => document.getElementById(id);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const encoder = new TextEncoder();
 let ch = null;
 let state = { events: [], memo: '' };
-const encoder = new TextEncoder();
 
 // ---------- 保存と復元（ブラウザ内） ----------
 function load() {
@@ -65,10 +74,14 @@ function load() {
     const s = JSON.parse(localStorage.getItem(KEY));
     if (s && Array.isArray(s.events)) state = { events: s.events, memo: s.memo || '' };
   } catch (e) {}
+  try { $('pin').value = localStorage.getItem(PIN_KEY) || ''; } catch (e) {}
 }
 function save() {
   try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
 }
+$('pin').oninput = () => {
+  try { localStorage.setItem(PIN_KEY, $('pin').value.trim()); } catch (e) {}
+};
 
 // ---------- 画面に出す文字を組み立てる ----------
 function buildText() {
@@ -140,27 +153,43 @@ $('clear').onclick = () => {
 // ---------- Bluetooth ----------
 function setStatus(msg) { $('status').textContent = msg; }
 
-const bound = new WeakSet();
-let currentDev = null;   // 今つないでいるデバイス
-let connecting = null;   // 進行中の接続処理
-let pendingDev = null;   // 接続しようとしているデバイス
+class PinError extends Error {}
 
-// デバイスにつないで、時刻を渡す（初回はここでペアリングの確認が出る）
+const bound = new WeakSet();
+let connecting = null;          // 進行中の接続処理
+let pendingDev = null;          // 接続しようとしているデバイス
+let currentDev = null;          // 今つないでいるデバイス
+let suppressReconnect = false;  // true の間は、切れても自動で再接続しない
+
+// デバイスにつないで、暗証番号を確認してもらい、時刻を渡す
 async function doAttach(dev) {
   if (!bound.has(dev)) {
     bound.add(dev);
     dev.addEventListener('gattserverdisconnected', onDisconnected);
   }
+  suppressReconnect = false;
 
   let lastErr;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       setStatus('接続中…（' + attempt + '/3）');
       const srv = await dev.gatt.connect();
-        currentDev = dev;
-      await new Promise((r) => setTimeout(r, 500));     // 接続直後は少し待つ
+      currentDev = dev;
+      await sleep(500);                       // 接続直後は少し待つ
       const svc = await srv.getPrimaryService(SERVICE);
       ch = await svc.getCharacteristic(CHAR);
+      const st = await svc.getCharacteristic(STATUS_CHAR);
+
+      // 暗証番号を送って、許可されたかを確認する
+      const pin = $('pin').value.trim();
+      if (!pin) throw new PinError('暗証番号を入力してください');
+      await ch.writeValueWithResponse(encoder.encode('\x05' + pin));
+      const v = await st.readValue();
+      if (v.getUint8(0) !== 1) {
+        throw new PinError('暗証番号が違います（5回間違えると、1分間ロックされます）');
+      }
+
+      // 許可されたら、現在時刻を渡す
       await ch.writeValueWithResponse(
         encoder.encode('\x04' + Math.floor(Date.now() / 1000)));
       $('send').disabled = false;
@@ -169,15 +198,20 @@ async function doAttach(dev) {
     } catch (e) {
       lastErr = e;
       ch = null;
+      if (e instanceof PinError) {
+        // 暗証番号の間違いは、くり返し試さずに止める
+        suppressReconnect = true;
+        try { dev.gatt.disconnect(); } catch (_) {}
+        throw e;
+      }
       try { dev.gatt.disconnect(); } catch (_) {}
-      await new Promise((r) => setTimeout(r, 1000));
+      await sleep(1000);
     }
   }
   throw lastErr;
 }
 
 // 接続処理は、同時に1つだけ走らせる
-// すでに進行中のものがあれば、取り消して終わるのを待ってから始める
 async function attach(dev) {
   if (connecting) {
     try { if (pendingDev) pendingDev.gatt.disconnect(); } catch (e) {}
@@ -193,14 +227,23 @@ async function attach(dev) {
   }
 }
 
+function showError(e) {
+  if (e instanceof PinError) setStatus(e.message);
+  else setStatus('接続できませんでした: ' + e.message);
+}
+
 function onDisconnected(ev) {
   ch = null;
   $('send').disabled = true;
+  if (suppressReconnect) return;   // 暗証番号エラーなどのときは、そのままにする
   setStatus('切断されました。再接続を試みます…');
   setTimeout(async () => {
-    if (connecting || ch) return;        // すでに接続中・接続済みなら何もしない
+    if (connecting || ch) return;
     try { await attach(ev.target); }
-    catch (e) { setStatus('切断されました。「接続」を押してください'); }
+    catch (e) {
+      if (e instanceof PinError) setStatus(e.message);
+      else setStatus('切断されました。「接続」を押してください');
+    }
   }, 1500);
 }
 
@@ -209,45 +252,23 @@ if (!navigator.bluetooth) {
   $('conn').disabled = true;
 }
 
-// 「接続」ボタン（初回、または自動接続できなかったとき）
+// 「接続」ボタン
 $('conn').onclick = async () => {
   try {
     setStatus('探しています…');
     const dev = await navigator.bluetooth.requestDevice({
       filters: [{ services: [SERVICE] }]
     });
-    setStatus('接続中…（パスキーの入力を求められたら、設定した6桁を入れてください）');
     await attach(dev);
   } catch (e) {
-    setStatus('接続できませんでした: ' + e.message);
+    showError(e);
   }
 };
-
-// ページを開いたとき、前回つないだデバイスへ自動でつなぐ
-async function autoConnect() {
-  if (!navigator.bluetooth) return;
-  if (!navigator.bluetooth.getDevices) {
-    setStatus('未接続（このブラウザは自動接続に未対応です。「接続」を押してください）');
-    return;
-  }
-  try {
-    const devs = await navigator.bluetooth.getDevices();
-    console.log('getDevices:', devs.map((d) => d.name));
-    const dev = devs.find((d) => d.name === 'epaper-memo') || devs[0];
-    if (!dev) {
-      setStatus('未接続（前回のデバイス情報がありません。「接続」を押してください）');
-      return;
-    }
-    setStatus('前回のデバイスに自動接続中…');
-    await attach(dev);
-  } catch (e) {
-    setStatus('自動接続できませんでした（' + e.message + '）。「接続」を押してください');
-  }
-}
 
 // ページを閉じる・再読み込みする直前に、自分から切断する
 window.addEventListener('pagehide', () => {
   try {
+    suppressReconnect = true;
     if (currentDev && currentDev.gatt.connected) currentDev.gatt.disconnect();
   } catch (e) {}
 });
@@ -285,7 +306,6 @@ load();
 $('memo').value = state.memo;
 renderRows();
 update();
-autoConnect();
 </script>
 </body>
 </html>
