@@ -225,15 +225,23 @@ $('conn').onclick = async () => {
 
 // ページを開いたとき、前回つないだデバイスへ自動でつなぐ
 async function autoConnect() {
-  if (!navigator.bluetooth || !navigator.bluetooth.getDevices) return;
+  if (!navigator.bluetooth) return;
+  if (!navigator.bluetooth.getDevices) {
+    setStatus('未接続（このブラウザは自動接続に未対応です。「接続」を押してください）');
+    return;
+  }
   try {
     const devs = await navigator.bluetooth.getDevices();
+    console.log('getDevices:', devs.map((d) => d.name));
     const dev = devs.find((d) => d.name === 'epaper-memo') || devs[0];
-    if (!dev) return;
+    if (!dev) {
+      setStatus('未接続（前回のデバイス情報がありません。「接続」を押してください）');
+      return;
+    }
     setStatus('前回のデバイスに自動接続中…');
     await attach(dev);
   } catch (e) {
-    setStatus('自動接続できませんでした。「接続」を押してください');
+    setStatus('自動接続できませんでした（' + e.message + '）。「接続」を押してください');
   }
 }
 
