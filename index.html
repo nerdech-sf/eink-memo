@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>E-Paper Memo</title>
+<style>
+  body { font-family: sans-serif; max-width: 520px; margin: 1.5em auto; padding: 0 1em; }
+  textarea { width: 100%; box-sizing: border-box; font-size: 16px; }
+  button { padding: .6em 1.4em; font-size: 16px; margin-right: .5em; }
+  #status { margin: .8em 0; padding: .5em .8em; background: #eee; border-radius: 6px; }
+  .note { color: #666; font-size: 14px; }
+</style>
+</head>
+<body>
+<h2>E-Paper Memo</h2>
+
+<div id="status">未接続</div>
+<button id="conn">接続</button>
+
+<p><textarea id="txt" rows="12" maxlength="1000" placeholder="ここに入力"></textarea></p>
+<button id="send" disabled>画面に反映</button>
+<span id="count" class="note">0 / 1000</span>
+
+<p class="note">
+  使えるのは英数字と記号のみです（日本語は無視されます）。<br>
+  ChromeまたはEdgeで開いてください。
+</p>
+
+<script>
+const SERVICE = '6e2f0001-b5a3-f393-e0a9-e50e24dcca9e';
+const CHAR    = '6e2f0002-b5a3-f393-e0a9-e50e24dcca9e';
+const CHUNK   = 100;   // 送信に失敗する場合は 19 に下げる
+
+const $ = (id) => document.getElementById(id);
+let ch = null;
+
+function setStatus(msg) { $('status').textContent = msg; }
+
+if (!navigator.bluetooth) {
+  setStatus('このブラウザはBluetoothに対応していません（Chrome / Edge を使ってください）');
+  $('conn').disabled = true;
+}
+
+$('txt').addEventListener('input', () => {
+  $('count').textContent = $('txt').value.length + ' / 1000';
+});
+
+$('conn').onclick = async () => {
+  try {
+    setStatus('探しています…');
+    const dev = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE] }]
+    });
+    dev.addEventListener('gattserverdisconnected', () => {
+      ch = null;
+      $('send').disabled = true;
+      setStatus('切断されました。もう一度「接続」を押してください');
+    });
+    const srv = await dev.gatt.connect();
+    const svc = await srv.getPrimaryService(SERVICE);
+    ch = await svc.getCharacteristic(CHAR);
+    $('send').disabled = false;
+    setStatus('接続済み: ' + dev.name);
+  } catch (e) {
+    setStatus('接続できませんでした: ' + e.message);
+  }
+};
+
+$('send').onclick = async () => {
+  if (!ch) return;
+  try {
+    $('send').disabled = true;
+    setStatus('送信中…');
+    const data = new TextEncoder().encode($('txt').value);
+    await ch.writeValueWithResponse(Uint8Array.of(0x01));          // 開始
+    for (let i = 0; i < data.length; i += CHUNK) {
+      const part = data.slice(i, i + CHUNK);
+      const buf = new Uint8Array(part.length + 1);
+      buf[0] = 0x02;                                                // 追加
+      buf.set(part, 1);
+      await ch.writeValueWithResponse(buf);
+    }
+    await ch.writeValueWithResponse(Uint8Array.of(0x03));          // 終了
+    setStatus('送信しました（画面の更新に数秒かかります）');
+  } catch (e) {
+    setStatus('送信に失敗しました: ' + e.message);
+  } finally {
+    $('send').disabled = !ch;
+  }
+};
+</script>
+</body>
+</html>
