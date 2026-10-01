@@ -141,9 +141,11 @@ $('clear').onclick = () => {
 function setStatus(msg) { $('status').textContent = msg; }
 
 const bound = new WeakSet();
+let connecting = null;   // 進行中の接続処理
+let pendingDev = null;   // 接続しようとしているデバイス
 
 // デバイスにつないで、時刻を渡す（初回はここでペアリングの確認が出る）
-async function attach(dev) {
+async function doAttach(dev) {
   if (!bound.has(dev)) {
     bound.add(dev);
     dev.addEventListener('gattserverdisconnected', onDisconnected);
@@ -157,11 +159,29 @@ async function attach(dev) {
   setStatus('接続済み: ' + dev.name);
 }
 
+// 接続処理は、同時に1つだけ走らせる
+// すでに進行中のものがあれば、取り消して終わるのを待ってから始める
+async function attach(dev) {
+  if (connecting) {
+    try { if (pendingDev) pendingDev.gatt.disconnect(); } catch (e) {}
+    try { await connecting; } catch (e) {}
+  }
+  const p = doAttach(dev);
+  pendingDev = dev;
+  connecting = p;
+  try {
+    await p;
+  } finally {
+    if (connecting === p) { connecting = null; pendingDev = null; }
+  }
+}
+
 function onDisconnected(ev) {
   ch = null;
   $('send').disabled = true;
   setStatus('切断されました。再接続を試みます…');
   setTimeout(async () => {
+    if (connecting || ch) return;        // すでに接続中・接続済みなら何もしない
     try { await attach(ev.target); }
     catch (e) { setStatus('切断されました。「接続」を押してください'); }
   }, 1500);
@@ -199,7 +219,6 @@ async function autoConnect() {
     setStatus('自動接続できませんでした。「接続」を押してください');
   }
 }
-
 // ---------- 画面に反映 ----------
 $('send').onclick = async () => {
   if (!ch) return;
