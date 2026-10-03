@@ -50,21 +50,25 @@
 </p>
 
 <p class="note">
-  ChromeまたはEdgeで開いてください。絵文字や特殊な記号は、表示できないことがあります。
+  ChromeまたはEdgeで開いてください。絵文字や特殊な記号は、表示できないことがあります。<br>
+  接続すると、ESP32に入っている内容が、自動で読み込まれます。
 </p>
 
 <script>
 const SERVICE     = '6e2f0001-b5a3-f393-e0a9-e50e24dcca9e';
 const CHAR        = '6e2f0002-b5a3-f393-e0a9-e50e24dcca9e';
 const STATUS_CHAR = '6e2f0003-b5a3-f393-e0a9-e50e24dcca9e';
+const TEXT_CHAR   = '6e2f0004-b5a3-f393-e0a9-e50e24dcca9e';
 const CHUNK    = 100;          // 送信に失敗する場合は 19 に下げる
 const KEY      = 'epaper-memo-v1';
 const PIN_KEY  = 'epaper-memo-pin';
+const SYNC_KEY = 'epaper-memo-synced';   // 最後にESP32と一致していた内容
 const MAXBYTES = 1500;
 
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 let ch = null;
 let state = { events: [], memo: '' };
 
@@ -79,13 +83,19 @@ function load() {
 function save() {
   try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
 }
+function getSynced() {
+  try { return localStorage.getItem(SYNC_KEY); } catch (e) { return null; }
+}
+function setSynced(t) {
+  try { localStorage.setItem(SYNC_KEY, t); } catch (e) {}
+}
 $('pin').oninput = () => {
   try { localStorage.setItem(PIN_KEY, $('pin').value.trim()); } catch (e) {}
 };
 
-// ---------- 画面に出す文字を組み立てる ----------
-function buildText() {
-  const evs = state.events.filter((e) => (e.title || '').trim());
+// ---------- 画面に出す文字の組み立てと読み取り ----------
+function buildTextFrom(s) {
+  const evs = s.events.filter((e) => (e.title || '').trim());
   const timed = evs.filter((e) => e.t).sort((a, b) => a.t.localeCompare(b.t));
   const untimed = evs.filter((e) => !e.t);
   const lines = [
@@ -93,9 +103,28 @@ function buildText() {
     ...untimed.map((e) => e.title.trim()),
   ];
   let text = lines.join('\n');
-  const memo = state.memo.trim();
-  if (memo) text += (text ? '\n\n' : '') + memo;
+  const memo = (s.memo || '').trim();
+  // 予定がなくてメモだけのときは、先頭に空行を入れて、メモとして扱わせる
+  if (memo) text += (text ? '\n\n' : '\n') + memo;
   return text;
+}
+function buildText() { return buildTextFrom(state); }
+
+// 画面の文字から、予定とメモに戻す
+function parseText(text) {
+  const events = [];
+  const memoLines = [];
+  let inMemo = false;
+  for (const ln of text.replace(/\r/g, '').split('\n')) {
+    if (!inMemo && ln === '') { inMemo = true; continue; }
+    if (!inMemo) {
+      const m = ln.match(/^(\d\d:\d\d) (.*)$/);
+      events.push(m ? { t: m[1], title: m[2] } : { t: '', title: ln });
+    } else {
+      memoLines.push(ln);
+    }
+  }
+  return { events, memo: memoLines.join('\n') };
 }
 
 function update() {
@@ -161,7 +190,55 @@ let pendingDev = null;          // 接続しようとしているデバイス
 let currentDev = null;          // 今つないでいるデバイス
 let suppressReconnect = false;  // true の間は、切れても自動で再接続しない
 
-// デバイスにつないで、暗証番号を確認してもらい、時刻を渡す
+// ESP32に入っている内容を読み出す
+async function pullText(svc) {
+  const tc = await svc.getCharacteristic(TEXT_CHAR);
+  let got = new Uint8Array(0);
+  for (let guard = 0; guard < 40; guard++) {
+    await ch.writeValueWithResponse(encoder.encode('\x06' + got.length));   // 読み出す位置を指定
+    const v = await tc.readValue();
+    const b = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+    if (b.length < 4) throw new Error('読み取りに失敗しました');
+    const total = parseInt(decoder.decode(b.slice(0, 4)), 10);
+    if (!(total > 0)) return '';
+    const part = b.slice(4);
+    if (part.length === 0) break;
+    const merged = new Uint8Array(got.length + part.length);
+    merged.set(got);
+    merged.set(part, got.length);
+    got = merged;
+    if (got.length >= total) break;
+  }
+  return decoder.decode(got);
+}
+
+// ESP32の内容を、このページに取り込む（取り込んだら true）
+async function syncFromDevice(svc) {
+  const remoteRaw = await pullText(svc);
+  const remote = buildTextFrom(parseText(remoteRaw));   // 形をそろえて比べる
+  const local = buildText();
+
+  if (remote === local) { setSynced(local); return false; }
+
+  // このページに、まだ送っていない編集がなければ、そのまま取り込む
+  let adopt = (local === (getSynced() ?? ''));
+  if (!adopt) {
+    adopt = confirm(
+      'このページの内容と、ESP32の内容が違います。\n' +
+      'ESP32の内容を読み込みますか？\n' +
+      '（キャンセルすると、このページの内容を残します）');
+  }
+  if (adopt) {
+    state = parseText(remoteRaw);
+    $('memo').value = state.memo;
+    renderRows();
+    update();
+    setSynced(buildText());
+  }
+  return adopt;
+}
+
+// デバイスにつないで、暗証番号を確認してもらい、時刻を渡して、内容を読み込む
 async function doAttach(dev) {
   if (!bound.has(dev)) {
     bound.add(dev);
@@ -192,8 +269,18 @@ async function doAttach(dev) {
       // 許可されたら、現在時刻を渡す
       await ch.writeValueWithResponse(
         encoder.encode('\x04' + Math.floor(Date.now() / 1000)));
+
+      // ESP32に入っている内容を読み込む（失敗しても、接続は続ける）
+      let note = '';
+      try {
+        if (await syncFromDevice(svc)) note = '（ESP32の内容を読み込みました）';
+      } catch (e) {
+        console.warn('sync failed', e);
+        note = '（ESP32の内容は読み込めませんでした）';
+      }
+
       $('send').disabled = false;
-      setStatus('接続済み: ' + dev.name);
+      setStatus('接続済み: ' + dev.name + ' ' + note);
       return;
     } catch (e) {
       lastErr = e;
@@ -276,7 +363,8 @@ window.addEventListener('pagehide', () => {
 // ---------- 画面に反映 ----------
 $('send').onclick = async () => {
   if (!ch) return;
-  const data = encoder.encode(buildText());
+  const text = buildText();
+  const data = encoder.encode(text);
   if (data.length > MAXBYTES) {
     alert('文字数が多すぎます（' + MAXBYTES + 'バイトまで）');
     return;
@@ -293,6 +381,7 @@ $('send').onclick = async () => {
       await ch.writeValueWithResponse(buf);
     }
     await ch.writeValueWithResponse(Uint8Array.of(0x03));            // 終了
+    setSynced(text);                                                  // ESP32と一致した
     setStatus('送信しました（画面の更新に数秒かかります）');
   } catch (e) {
     setStatus('送信に失敗しました: ' + e.message);
